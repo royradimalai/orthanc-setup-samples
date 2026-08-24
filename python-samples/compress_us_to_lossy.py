@@ -1,10 +1,19 @@
+from io import BytesIO
 import json
+import uuid
 
 import orthanc
+
+try:
+    from pydicom import dcmread, dcmwrite
+except ImportError:
+    dcmread = None
+    dcmwrite = None
 
 
 TARGET_TRANSFER_SYNTAX = '1.2.840.10008.1.2.4.50'
 LOSSY_QUALITY = 70
+COMPRESSION_PROFILE_VERSION = 1
 LOSSY_TRANSFER_SYNTAXES = {
     '1.2.840.10008.1.2.4.50',
     '1.2.840.10008.1.2.4.51',
@@ -16,7 +25,7 @@ IDENTITY_TAGS = (
     'PatientID',
     'StudyInstanceUID',
     'SeriesInstanceUID',
-    'SOPInstanceUID',
+    'SOPClassUID',
 )
 
 
@@ -24,16 +33,15 @@ def GetTags(dicom):
     return json.loads(dicom.GetInstanceSimplifiedJson())
 
 
-def IsOverwriteEnabled(value):
-    return value is True or value in ('Always', 'IfChanged')
-
-
 def ValidateConfiguration():
-    configuration = json.loads(orthanc.GetConfiguration())
+    if dcmread is None or dcmwrite is None:
+        raise RuntimeError('pydicom is required for US compression')
 
-    if not IsOverwriteEnabled(configuration.get('OverwriteInstances')):
+    configuration = json.loads(orthanc.GetConfiguration())
+    quality = configuration.get('DicomLossyTranscodingQuality', 90)
+    if quality != LOSSY_QUALITY:
         raise RuntimeError(
-            'OverwriteInstances must be true, Always, or IfChanged'
+            f'DicomLossyTranscodingQuality must be {LOSSY_QUALITY}, got {quality}'
         )
 
     if (
@@ -53,20 +61,49 @@ def IsLossy(dicom, tags):
     )
 
 
-def GetDerivedImageType(tags):
+def IsDerived(tags):
     imageType = tags.get('ImageType')
     if isinstance(imageType, list):
-        parts = imageType
-    elif imageType:
-        parts = imageType.split('\\')
-    else:
-        parts = ['DERIVED', 'PRIMARY']
-
-    parts[0] = 'DERIVED'
-    return '\\'.join(parts)
+        return bool(imageType) and imageType[0] == 'DERIVED'
+    return str(imageType or '').split('\\')[0] == 'DERIVED'
 
 
-def ValidateTranscodedDicom(source, sourceTags, transcoded):
+def BuildDeterministicSopInstanceUid(sourceSopInstanceUid):
+    profile = '|'.join((
+        sourceSopInstanceUid,
+        TARGET_TRANSFER_SYNTAX,
+        str(LOSSY_QUALITY),
+        str(COMPRESSION_PROFILE_VERSION),
+    ))
+    return f'2.25.{uuid.uuid5(uuid.NAMESPACE_URL, profile).int}'
+
+
+def RewriteSopInstanceUid(transcodedBytes, sourceSopInstanceUid):
+    dataset = dcmread(BytesIO(transcodedBytes))
+    generatedSopInstanceUid = str(dataset.SOPInstanceUID)
+    if generatedSopInstanceUid == sourceSopInstanceUid:
+        raise ValueError('lossy transcoding did not generate a new SOPInstanceUID')
+
+    deterministicSopInstanceUid = BuildDeterministicSopInstanceUid(
+        sourceSopInstanceUid
+    )
+    dataset.SOPInstanceUID = deterministicSopInstanceUid
+
+    if not getattr(dataset, 'file_meta', None):
+        raise ValueError('transcoded DICOM is missing file metadata')
+    dataset.file_meta.MediaStorageSOPInstanceUID = deterministicSopInstanceUid
+
+    output = BytesIO()
+    dcmwrite(output, dataset, write_like_original=False)
+    return output.getvalue(), deterministicSopInstanceUid
+
+
+def ValidateTranscodedDicom(
+    source,
+    sourceTags,
+    transcoded,
+    expectedSopInstanceUid,
+):
     transcodedTags = GetTags(transcoded)
 
     for tag in IDENTITY_TAGS:
@@ -75,6 +112,9 @@ def ValidateTranscodedDicom(source, sourceTags, transcoded):
             or transcodedTags.get(tag) != sourceTags.get(tag)
         ):
             raise ValueError(f'{tag} changed during transcoding')
+
+    if transcodedTags.get('SOPInstanceUID') != expectedSopInstanceUid:
+        raise ValueError('unexpected SOPInstanceUID after transcoding')
 
     if transcoded.GetInstanceTransferSyntaxUid() != TARGET_TRANSFER_SYNTAX:
         raise ValueError('unexpected transfer syntax after transcoding')
@@ -88,74 +128,58 @@ def ValidateTranscodedDicom(source, sourceTags, transcoded):
     if transcodedTags.get('LossyImageCompressionMethod') != 'ISO_10918_1':
         raise ValueError('lossy compression method metadata is missing')
 
-    if not str(transcodedTags.get('ImageType', '')).startswith('DERIVED'):
+    if not IsDerived(transcodedTags):
         raise ValueError('derived image metadata is missing')
 
 
-def BuildModification(tags):
-    sopInstanceUid = tags.get('SOPInstanceUID')
-    if not sopInstanceUid:
-        raise ValueError('SOPInstanceUID is missing')
-
-    return {
-        'Transcode': TARGET_TRANSFER_SYNTAX,
-        'Replace': {
-            'SOPInstanceUID': sopInstanceUid,
-            'ImageType': GetDerivedImageType(tags),
-            'LossyImageCompression': '01',
-            'LossyImageCompressionMethod': 'ISO_10918_1',
-            'DerivationDescription': (
-                f'Lossy JPEG compression at quality {LOSSY_QUALITY}'
-            ),
-        },
-        'Force': True,
-        'LossyQuality': LOSSY_QUALITY,
-    }
-
-
-def OnStoredInstance(dicom, instanceId):
+def ReceivedInstanceCallback(receivedDicom, origin):
     try:
-        tags = GetTags(dicom)
-        if tags.get('Modality') != 'US':
-            return
+        source = orthanc.CreateDicomInstance(receivedDicom)
+        sourceTags = GetTags(source)
 
-        if dicom.GetInstanceFramesCount() <= 1 or IsLossy(dicom, tags):
-            return
+        if sourceTags.get('Modality') != 'US':
+            return orthanc.ReceivedInstanceAction.KEEP_AS_IS, None
 
-        transcodedBytes = orthanc.RestApiPost(
-            f'/instances/{instanceId}/modify',
-            json.dumps(BuildModification(tags)),
+        if source.GetInstanceFramesCount() <= 1 or IsLossy(source, sourceTags):
+            return orthanc.ReceivedInstanceAction.KEEP_AS_IS, None
+
+        sourceSopInstanceUid = sourceTags.get('SOPInstanceUID')
+        if not sourceSopInstanceUid:
+            raise ValueError('SOPInstanceUID is missing')
+
+        transcoded = orthanc.TranscodeDicomInstance(
+            receivedDicom,
+            TARGET_TRANSFER_SYNTAX,
         )
-        transcoded = orthanc.CreateDicomInstance(transcodedBytes)
-        ValidateTranscodedDicom(dicom, tags, transcoded)
-
-        uploadResponse = json.loads(
-            orthanc.RestApiPost('/instances', transcodedBytes)
+        transcodedBytes, deterministicSopInstanceUid = RewriteSopInstanceUid(
+            transcoded.SerializeDicomInstance(),
+            sourceSopInstanceUid,
         )
-        if uploadResponse.get('ID') != instanceId:
-            orthanc.LogError(
-                f'Transcoded instance {uploadResponse.get("ID")} does not '
-                f'match source {instanceId}'
-            )
-            return
+        validated = orthanc.CreateDicomInstance(transcodedBytes)
+        ValidateTranscodedDicom(
+            source,
+            sourceTags,
+            validated,
+            deterministicSopInstanceUid,
+        )
 
         orthanc.LogInfo(
-            f'Transcoded multiframe US to JPEG Lossy: {instanceId}. '
-            f'New size = {len(transcodedBytes)} vs {dicom.GetInstanceSize()}'
+            f'Transcoded multiframe US to JPEG Lossy before storage: '
+            f'{len(receivedDicom)} bytes to {len(transcodedBytes)} bytes'
         )
+        return orthanc.ReceivedInstanceAction.MODIFY, transcodedBytes
     except Exception as e:
         orthanc.LogError(
             f'Keeping original DICOM after US transcoding failed: {e}'
         )
+        return orthanc.ReceivedInstanceAction.KEEP_AS_IS, None
 
 
-# This deliberately keeps the SOP Instance UID while changing the pixel data so
-# the active object can be replaced. This is not DICOM-conformant and can make
-# external systems retain the earlier object. Archive the original outside
-# Orthanc before enabling it. Other stored-instance callbacks should ignore the
-# REST-origin replacement if they must run only once per incoming instance.
+# Install requirements-compress-us-to-lossy.txt and use Orthanc Python plugin
+# 4.0 or newer. The deterministic derived SOP UID prevents retransmission
+# duplicates.
 try:
     ValidateConfiguration()
-    orthanc.RegisterOnStoredInstanceCallback(OnStoredInstance)
+    orthanc.RegisterReceivedInstanceCallback(ReceivedInstanceCallback)
 except Exception as e:
     orthanc.LogError(f'US compression plugin disabled: {e}')
