@@ -1,47 +1,161 @@
-import orthanc
 import json
 
-# this script compresses US images to lossy JPEG to reduce their sizes.
-# Prerequisites:
-# - You must have "OverwriteInstances" set to true (or to "Always"/"IfChanged" if you are using Orthanc 1.13.0+)
-# - If you have not configured an "IngestTranscoding", this script will work fine.
-# - If you have configured an "IngestTranscoding", this script will
-#   work only if you have also set "IngestTranscodingOfCompressed" to false to aovid
-#   re-applying IngestTranscoding to the modified instance.
+import orthanc
+
+
+TARGET_TRANSFER_SYNTAX = '1.2.840.10008.1.2.4.50'
+LOSSY_QUALITY = 70
+LOSSY_TRANSFER_SYNTAXES = {
+    '1.2.840.10008.1.2.4.50',
+    '1.2.840.10008.1.2.4.51',
+    '1.2.840.10008.1.2.4.81',
+    '1.2.840.10008.1.2.4.91',
+    '1.2.840.10008.1.2.4.203',
+}
+IDENTITY_TAGS = (
+    'PatientID',
+    'StudyInstanceUID',
+    'SeriesInstanceUID',
+    'SOPInstanceUID',
+)
+
+
+def GetTags(dicom):
+    return json.loads(dicom.GetInstanceSimplifiedJson())
+
+
+def IsOverwriteEnabled(value):
+    return value is True or value in ('Always', 'IfChanged')
+
+
+def ValidateConfiguration():
+    configuration = json.loads(orthanc.GetConfiguration())
+
+    if not IsOverwriteEnabled(configuration.get('OverwriteInstances')):
+        raise RuntimeError(
+            'OverwriteInstances must be true, Always, or IfChanged'
+        )
+
+    if (
+        configuration.get('IngestTranscoding')
+        and configuration.get('IngestTranscodingOfCompressed', True)
+    ):
+        raise RuntimeError(
+            'IngestTranscodingOfCompressed must be false when '
+            'IngestTranscoding is configured'
+        )
+
+
+def IsLossy(dicom, tags):
+    return (
+        dicom.GetInstanceTransferSyntaxUid() in LOSSY_TRANSFER_SYNTAXES
+        or tags.get('LossyImageCompression') == '01'
+    )
+
+
+def GetDerivedImageType(tags):
+    imageType = tags.get('ImageType')
+    if isinstance(imageType, list):
+        parts = imageType
+    elif imageType:
+        parts = imageType.split('\\')
+    else:
+        parts = ['DERIVED', 'PRIMARY']
+
+    parts[0] = 'DERIVED'
+    return '\\'.join(parts)
+
+
+def ValidateTranscodedDicom(source, sourceTags, transcoded):
+    transcodedTags = GetTags(transcoded)
+
+    for tag in IDENTITY_TAGS:
+        if (
+            not sourceTags.get(tag)
+            or transcodedTags.get(tag) != sourceTags.get(tag)
+        ):
+            raise ValueError(f'{tag} changed during transcoding')
+
+    if transcoded.GetInstanceTransferSyntaxUid() != TARGET_TRANSFER_SYNTAX:
+        raise ValueError('unexpected transfer syntax after transcoding')
+
+    if transcoded.GetInstanceFramesCount() != source.GetInstanceFramesCount():
+        raise ValueError('frame count changed during transcoding')
+
+    if transcodedTags.get('LossyImageCompression') != '01':
+        raise ValueError('lossy compression metadata is missing')
+
+    if transcodedTags.get('LossyImageCompressionMethod') != 'ISO_10918_1':
+        raise ValueError('lossy compression method metadata is missing')
+
+    if not str(transcodedTags.get('ImageType', '')).startswith('DERIVED'):
+        raise ValueError('derived image metadata is missing')
+
+
+def BuildModification(tags):
+    sopInstanceUid = tags.get('SOPInstanceUID')
+    if not sopInstanceUid:
+        raise ValueError('SOPInstanceUID is missing')
+
+    return {
+        'Transcode': TARGET_TRANSFER_SYNTAX,
+        'Replace': {
+            'SOPInstanceUID': sopInstanceUid,
+            'ImageType': GetDerivedImageType(tags),
+            'LossyImageCompression': '01',
+            'LossyImageCompressionMethod': 'ISO_10918_1',
+            'DerivationDescription': (
+                f'Lossy JPEG compression at quality {LOSSY_QUALITY}'
+            ),
+        },
+        'Force': True,
+        'LossyQuality': LOSSY_QUALITY,
+    }
 
 
 def OnStoredInstance(dicom, instanceId):
-    
-    tags = json.loads(dicom.GetInstanceSimplifiedJson())
-
-    # only handle the US images
-    if tags.get('Modality') == 'US':
-
-        # optional: only compress the multiframe US images since these are the ones consuming more space
-        if dicom.GetInstanceFramesCount() == '1':
+    try:
+        tags = GetTags(dicom)
+        if tags.get('Modality') != 'US':
             return
 
-        transfer_syntax = dicom.GetInstanceTransferSyntaxUid()
-
-        # don't transcode if it is already in lossy jpeg
-        if transfer_syntax in ['1.2.840.10008.1.2.4.50', '1.2.840.10008.1.2.4.51']:
+        if dicom.GetInstanceFramesCount() <= 1 or IsLossy(dicom, tags):
             return
 
-        # download a transcoded instance and make sur to keep the SOPInstanceUID unchanged
-        transcoded_instance = orthanc.RestApiPost(f'/instances/{instanceId}/modify', json.dumps({
-            "Transcode": "1.2.840.10008.1.2.4.50", 
-            "Replace": {"SOPInstanceUID": tags.get('SOPInstanceUID') }, 
-            "Force": True,
-            "LossyQuality": 70
-        }))
+        transcodedBytes = orthanc.RestApiPost(
+            f'/instances/{instanceId}/modify',
+            json.dumps(BuildModification(tags)),
+        )
+        transcoded = orthanc.CreateDicomInstance(transcodedBytes)
+        ValidateTranscodedDicom(dicom, tags, transcoded)
 
-        # re-upload the instance.
-        upload_response = json.loads(orthanc.RestApiPost('/instances', transcoded_instance))
-
-        if upload_response.get('ID') != instanceId:
-            orthanc.LogError(f'The transcoded instance {upload_response.get("ID")} does not have the same ID as the source {instanceId}')
+        uploadResponse = json.loads(
+            orthanc.RestApiPost('/instances', transcodedBytes)
+        )
+        if uploadResponse.get('ID') != instanceId:
+            orthanc.LogError(
+                f'Transcoded instance {uploadResponse.get("ID")} does not '
+                f'match source {instanceId}'
+            )
             return
 
-        orthanc.LogInfo(f"Transcoded US image to JPEG Lossy: {instanceId}.  New size = {len(transcoded_instance)} vs {dicom.GetInstanceSize()}")
+        orthanc.LogInfo(
+            f'Transcoded multiframe US to JPEG Lossy: {instanceId}. '
+            f'New size = {len(transcodedBytes)} vs {dicom.GetInstanceSize()}'
+        )
+    except Exception as e:
+        orthanc.LogError(
+            f'Keeping original DICOM after US transcoding failed: {e}'
+        )
 
-orthanc.RegisterOnStoredInstanceCallback(OnStoredInstance)
+
+# This deliberately keeps the SOP Instance UID while changing the pixel data so
+# the active object can be replaced. This is not DICOM-conformant and can make
+# external systems retain the earlier object. Archive the original outside
+# Orthanc before enabling it. Other stored-instance callbacks should ignore the
+# REST-origin replacement if they must run only once per incoming instance.
+try:
+    ValidateConfiguration()
+    orthanc.RegisterOnStoredInstanceCallback(OnStoredInstance)
+except Exception as e:
+    orthanc.LogError(f'US compression plugin disabled: {e}')
