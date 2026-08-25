@@ -1,3 +1,4 @@
+from concurrent.futures import Future
 import importlib.util
 from io import BytesIO
 import json
@@ -10,6 +11,7 @@ from pydicom import dcmread, dcmwrite
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.encaps import encapsulate
 from pydicom.uid import UID
+from botocore.exceptions import ClientError
 
 
 JPEG_BASELINE = '1.2.840.10008.1.2.4.50'
@@ -94,6 +96,57 @@ class FakeReceivedInstanceAction:
     MODIFY = 2
 
 
+class InlineExecutor:
+    def submit(self, function, *args):
+        future = Future()
+        try:
+            future.set_result(function(*args))
+        except Exception as error:
+            future.set_exception(error)
+        return future
+
+
+class FakeArchiveClient:
+    def __init__(self):
+        self.objects = {}
+        self.putCalls = []
+        self.error = None
+        self.responseChecksum = None
+
+    def put_object(self, **kwargs):
+        self.putCalls.append(kwargs)
+        if self.error:
+            raise self.error
+
+        objectKey = (kwargs['Bucket'], kwargs['Key'])
+        if objectKey in self.objects:
+            raise ClientError(
+                {
+                    'Error': {'Code': 'PreconditionFailed'},
+                    'ResponseMetadata': {'HTTPStatusCode': 412},
+                },
+                'PutObject',
+            )
+
+        self.objects[objectKey] = {
+            'Body': bytes(kwargs['Body']),
+            'ContentLength': kwargs['ContentLength'],
+            'Metadata': kwargs.get('Metadata', {}),
+        }
+        return {
+            'ChecksumSHA256': (
+                self.responseChecksum or kwargs['ChecksumSHA256']
+            )
+        }
+
+    def head_object(self, **kwargs):
+        return self.objects[(kwargs['Bucket'], kwargs['Key'])]
+
+    def get_object(self, **kwargs):
+        stored = self.objects[(kwargs['Bucket'], kwargs['Key'])]
+        return {'Body': BytesIO(stored['Body'])}
+
+
 class FakeOrthanc(types.ModuleType):
     def __init__(self):
         super().__init__('orthanc')
@@ -158,6 +211,9 @@ SPEC.loader.exec_module(MODULE)
 
 class CompressUltrasoundTests(unittest.TestCase):
     def setUp(self):
+        MODULE.ARCHIVE_BUCKET = 'lossless-archive'
+        MODULE.ARCHIVE_CLIENT = FakeArchiveClient()
+        MODULE.ARCHIVE_EXECUTOR = InlineExecutor()
         ORTHANC.configuration = {'DicomLossyTranscodingQuality': 70}
         ORTHANC.source = FakeDicom(MakeTags())
         ORTHANC.transcoded = FakeDicom(
@@ -200,6 +256,20 @@ class CompressUltrasoundTests(unittest.TestCase):
             dataset.SourceImageSequence[0].ReferencedSOPInstanceUID,
         )
         self.assertTrue(ORTHANC.infos)
+        self.assertEqual(2, len(MODULE.ARCHIVE_CLIENT.putCalls))
+        archiveCall = next(
+            call for call in MODULE.ARCHIVE_CLIENT.putCalls
+            if call['ContentType'] == 'application/dicom'
+        )
+        self.assertEqual('application/dicom', archiveCall['ContentType'])
+        self.assertEqual('AES256', archiveCall['ServerSideEncryption'])
+        self.assertEqual('*', archiveCall['IfNoneMatch'])
+        self.assertEqual(b'original', archiveCall['Body'])
+        self.assertIn(SOURCE_SOP_INSTANCE_UID, archiveCall['Key'])
+        self.assertTrue(any(
+            call['Key'].endswith('/manifest.json')
+            for call in MODULE.ARCHIVE_CLIENT.putCalls
+        ))
 
     def test_retransmission_uses_the_same_sop_instance_uid(self):
         firstAction, firstData = MODULE.ReceivedInstanceCallback(
@@ -216,6 +286,8 @@ class CompressUltrasoundTests(unittest.TestCase):
 
         self.assertEqual(firstAction, secondAction)
         self.assertEqual(firstData, secondData)
+        self.assertEqual(4, len(MODULE.ARCHIVE_CLIENT.putCalls))
+        self.assertEqual(2, len(MODULE.ARCHIVE_CLIENT.objects))
 
     def test_uid_rewrite_does_not_change_compressed_pixel_data(self):
         sourceBytes = MakeDicomBytes(pixelData=b'unchanged-pixels')
@@ -269,6 +341,7 @@ class CompressUltrasoundTests(unittest.TestCase):
 
         self.assertEqual((FakeReceivedInstanceAction.KEEP_AS_IS, None), result)
         self.assertEqual([], ORTHANC.transcodeCalls)
+        self.assertEqual([], MODULE.ARCHIVE_CLIENT.putCalls)
 
     def test_skips_single_frame_ultrasound(self):
         ORTHANC.source.frames = 1
@@ -294,6 +367,44 @@ class CompressUltrasoundTests(unittest.TestCase):
 
         self.assertEqual((FakeReceivedInstanceAction.KEEP_AS_IS, None), result)
         self.assertIn('transcode failed', ORTHANC.errors[0])
+
+    def test_keeps_original_when_lossless_archival_fails(self):
+        MODULE.ARCHIVE_CLIENT.error = RuntimeError('archive unavailable')
+
+        result = MODULE.ReceivedInstanceCallback(b'original', None)
+
+        self.assertEqual((FakeReceivedInstanceAction.KEEP_AS_IS, None), result)
+        self.assertIn('archive unavailable', ORTHANC.errors[0])
+
+    def test_keeps_original_when_archive_checksum_is_not_confirmed(self):
+        MODULE.ARCHIVE_CLIENT.responseChecksum = 'wrong-checksum'
+
+        result = MODULE.ReceivedInstanceCallback(b'original', None)
+
+        self.assertEqual((FakeReceivedInstanceAction.KEEP_AS_IS, None), result)
+        self.assertIn('did not confirm', ORTHANC.errors[0])
+
+    def test_different_source_bytes_use_different_archive_keys(self):
+        firstDigest = '1' * 64
+        secondDigest = '2' * 64
+
+        firstKey = MODULE.BuildArchiveKey(MakeTags(), firstDigest)
+        secondKey = MODULE.BuildArchiveKey(MakeTags(), secondDigest)
+
+        self.assertNotEqual(firstKey, secondKey)
+        self.assertTrue(firstKey.endswith(f'{firstDigest}.dcm'))
+
+    def test_preserves_and_rejects_reused_sop_uid_with_different_bytes(self):
+        MODULE.ArchiveOriginal(b'first', MakeTags())
+
+        with self.assertRaisesRegex(RuntimeError, 'manifest conflicts'):
+            MODULE.ArchiveOriginal(b'second', MakeTags())
+
+        dicomObjects = [
+            key for _, key in MODULE.ARCHIVE_CLIENT.objects
+            if key.endswith('.dcm')
+        ]
+        self.assertEqual(2, len(dicomObjects))
 
     def test_keeps_original_when_source_sop_instance_uid_is_missing(self):
         del ORTHANC.source.tags['SOPInstanceUID']
@@ -371,10 +482,16 @@ class CompressUltrasoundTests(unittest.TestCase):
         originalDcmread = MODULE.dcmread
         try:
             MODULE.dcmread = None
-            with self.assertRaisesRegex(RuntimeError, 'pydicom is required'):
+            with self.assertRaisesRegex(RuntimeError, 'pydicom and boto3'):
                 MODULE.ValidateConfiguration()
         finally:
             MODULE.dcmread = originalDcmread
+
+    def test_rejects_missing_archive_bucket(self):
+        MODULE.ARCHIVE_BUCKET = None
+
+        with self.assertRaisesRegex(RuntimeError, 'LOSSLESS_ARCHIVE_BUCKET'):
+            MODULE.ValidateConfiguration()
 
     def test_rejects_retranscoding_compressed_instances(self):
         ORTHANC.configuration = {
