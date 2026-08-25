@@ -53,10 +53,8 @@ def MakeDicomBytes(
     dataset.StudyInstanceUID = STUDY_INSTANCE_UID
     dataset.SeriesInstanceUID = SERIES_INSTANCE_UID
     dataset.Modality = 'US'
-    dataset.ImageType = ['DERIVED', 'PRIMARY']
+    dataset.ImageType = ['ORIGINAL', 'PRIMARY']
     dataset.NumberOfFrames = 10
-    dataset.LossyImageCompression = '01'
-    dataset.LossyImageCompressionMethod = 'ISO_10918_1'
     dataset.PixelData = encapsulate([pixelData])
     dataset['PixelData'].is_undefined_length = True
 
@@ -191,6 +189,16 @@ class CompressUltrasoundTests(unittest.TestCase):
             expectedUid,
             dataset.file_meta.MediaStorageSOPInstanceUID,
         )
+        self.assertEqual(['DERIVED', 'PRIMARY'], list(dataset.ImageType))
+        self.assertEqual('01', dataset.LossyImageCompression)
+        self.assertEqual(
+            'ISO_10918_1',
+            dataset.LossyImageCompressionMethod,
+        )
+        self.assertEqual(
+            SOURCE_SOP_INSTANCE_UID,
+            dataset.SourceImageSequence[0].ReferencedSOPInstanceUID,
+        )
         self.assertTrue(ORTHANC.infos)
 
     def test_retransmission_uses_the_same_sop_instance_uid(self):
@@ -212,7 +220,7 @@ class CompressUltrasoundTests(unittest.TestCase):
     def test_uid_rewrite_does_not_change_compressed_pixel_data(self):
         sourceBytes = MakeDicomBytes(pixelData=b'unchanged-pixels')
 
-        rewrittenBytes, expectedUid = MODULE.RewriteSopInstanceUid(
+        rewrittenBytes, expectedUid = MODULE.PrepareTranscodedDicom(
             sourceBytes,
             SOURCE_SOP_INSTANCE_UID,
         )
@@ -321,29 +329,37 @@ class CompressUltrasoundTests(unittest.TestCase):
         self.assertEqual((FakeReceivedInstanceAction.KEEP_AS_IS, None), result)
         self.assertIn('frame count changed', ORTHANC.errors[0])
 
-    def test_keeps_original_when_lossy_metadata_is_missing(self):
+    def test_adds_metadata_missing_from_orthanc_transcode_output(self):
+        action, data = MODULE.ReceivedInstanceCallback(b'original', None)
+
+        self.assertEqual(FakeReceivedInstanceAction.MODIFY, action)
+        dataset = dcmread(BytesIO(data))
+        self.assertEqual('01', dataset.LossyImageCompression)
+        self.assertEqual(
+            'ISO_10918_1',
+            dataset.LossyImageCompressionMethod,
+        )
+        self.assertEqual('DERIVED', dataset.ImageType[0])
+        self.assertEqual(
+            'Lossy JPEG compression at quality 70',
+            dataset.DerivationDescription,
+        )
+
+    def test_preserves_existing_image_type_components(self):
         data = dcmread(BytesIO(ORTHANC.transcoded.data))
-        del data.LossyImageCompression
+        data.ImageType = ['ORIGINAL', 'PRIMARY', 'DYNAMIC']
         output = BytesIO()
         dcmwrite(output, data, write_like_original=False)
         ORTHANC.transcoded.data = output.getvalue()
 
-        result = MODULE.ReceivedInstanceCallback(b'original', None)
+        action, data = MODULE.ReceivedInstanceCallback(b'original', None)
 
-        self.assertEqual((FakeReceivedInstanceAction.KEEP_AS_IS, None), result)
-        self.assertIn('lossy compression metadata is missing', ORTHANC.errors[0])
-
-    def test_keeps_original_when_derived_metadata_is_missing(self):
-        data = dcmread(BytesIO(ORTHANC.transcoded.data))
-        data.ImageType = ['ORIGINAL', 'PRIMARY']
-        output = BytesIO()
-        dcmwrite(output, data, write_like_original=False)
-        ORTHANC.transcoded.data = output.getvalue()
-
-        result = MODULE.ReceivedInstanceCallback(b'original', None)
-
-        self.assertEqual((FakeReceivedInstanceAction.KEEP_AS_IS, None), result)
-        self.assertIn('derived image metadata is missing', ORTHANC.errors[0])
+        self.assertEqual(FakeReceivedInstanceAction.MODIFY, action)
+        dataset = dcmread(BytesIO(data))
+        self.assertEqual(
+            ['DERIVED', 'PRIMARY', 'DYNAMIC'],
+            list(dataset.ImageType),
+        )
 
     def test_rejects_unexpected_lossy_quality(self):
         ORTHANC.configuration = {'DicomLossyTranscodingQuality': 90}

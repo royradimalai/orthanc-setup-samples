@@ -6,9 +6,11 @@ import orthanc
 
 try:
     from pydicom import dcmread, dcmwrite
+    from pydicom.dataset import Dataset
 except ImportError:
     dcmread = None
     dcmwrite = None
+    Dataset = None
 
 
 TARGET_TRANSFER_SYNTAX = '1.2.840.10008.1.2.4.50'
@@ -78,7 +80,23 @@ def BuildDeterministicSopInstanceUid(sourceSopInstanceUid):
     return f'2.25.{uuid.uuid5(uuid.NAMESPACE_URL, profile).int}'
 
 
-def RewriteSopInstanceUid(transcodedBytes, sourceSopInstanceUid):
+def BuildDerivedImageType(imageType):
+    if imageType is None:
+        return ['DERIVED', 'PRIMARY']
+
+    values = (
+        list(imageType)
+        if not isinstance(imageType, str)
+        else imageType.split('\\')
+    )
+    if not values:
+        return ['DERIVED', 'PRIMARY']
+
+    values[0] = 'DERIVED'
+    return values
+
+
+def PrepareTranscodedDicom(transcodedBytes, sourceSopInstanceUid):
     dataset = dcmread(BytesIO(transcodedBytes))
     generatedSopInstanceUid = str(dataset.SOPInstanceUID)
     if generatedSopInstanceUid == sourceSopInstanceUid:
@@ -92,6 +110,20 @@ def RewriteSopInstanceUid(transcodedBytes, sourceSopInstanceUid):
     if not getattr(dataset, 'file_meta', None):
         raise ValueError('transcoded DICOM is missing file metadata')
     dataset.file_meta.MediaStorageSOPInstanceUID = deterministicSopInstanceUid
+
+    dataset.ImageType = BuildDerivedImageType(
+        getattr(dataset, 'ImageType', None)
+    )
+    dataset.LossyImageCompression = '01'
+    dataset.LossyImageCompressionMethod = 'ISO_10918_1'
+    dataset.DerivationDescription = (
+        f'Lossy JPEG compression at quality {LOSSY_QUALITY}'
+    )
+
+    sourceReference = Dataset()
+    sourceReference.ReferencedSOPClassUID = dataset.SOPClassUID
+    sourceReference.ReferencedSOPInstanceUID = sourceSopInstanceUid
+    dataset.SourceImageSequence = [sourceReference]
 
     output = BytesIO()
     dcmwrite(output, dataset, write_like_original=False)
@@ -151,7 +183,7 @@ def ReceivedInstanceCallback(receivedDicom, origin):
             receivedDicom,
             TARGET_TRANSFER_SYNTAX,
         )
-        transcodedBytes, deterministicSopInstanceUid = RewriteSopInstanceUid(
+        transcodedBytes, deterministicSopInstanceUid = PrepareTranscodedDicom(
             transcoded.SerializeDicomInstance(),
             sourceSopInstanceUid,
         )
